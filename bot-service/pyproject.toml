@@ -18,10 +18,6 @@ core = [
     "sqlalchemy>=2.0.0",
     "uvicorn==0.34.0",
 ]
-telegram = [
-    "aiogram==3.18.0",
-    "httpx==0.28.1",
-]
 vk = [
     "httpx==0.28.1",
     "vkbottle==4.6.2",

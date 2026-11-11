@@ -1,16 +1,18 @@
-"""Подключение к базе данных и ORM-модели bot-core."""
+"""Подключение к базе данных и ORM-модели bot-core.
+
+Логика ответов живёт в Dify, поэтому здесь хранится только то, что нужно
+витрине: пользователь мессенджера, его текущий диалог в Dify и ответы,
+к которым привязаны оценки.
+"""
 
 from __future__ import annotations
 
 from datetime import datetime
 
 from sqlalchemy import (
-    ARRAY,
-    Boolean,
     DateTime,
     ForeignKey,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -23,7 +25,7 @@ from config import settings
 
 
 DATABASE_URL = (
-    f"postgresql://{settings.postgres_user}:{settings.postgres_password}"
+    f"postgresql+psycopg2://{settings.postgres_user}:{settings.postgres_password}"
     f"@{settings.postgres_host}:{settings.postgres_port}/{settings.postgres_db}"
 )
 
@@ -37,7 +39,14 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    """Пользователь бота."""
+    """Пользователь мессенджера и его текущий диалог в Dify.
+
+    Attributes:
+        platform: Платформа пользователя (`vk`, `max`).
+        platform_user_id: Идентификатор пользователя на платформе.
+        dify_conversation_id: Текущий диалог в Dify; `None` — следующий
+            вопрос начнёт новый диалог.
+    """
 
     __tablename__ = "users"
     __table_args__ = (
@@ -54,131 +63,52 @@ class User(Base):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     last_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    is_subscribed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    created_at: Mapped[datetime | None] = mapped_column(
+    dify_conversation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
         nullable=False,
     )
-    updated_at: Mapped[datetime | None] = mapped_column(
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
-        server_onupdate=text("now()"),
         nullable=False,
     )
 
+    @property
+    def dify_user(self) -> str:
+        """Стабильный идентификатор пользователя для параметра `user` в Dify."""
 
-class Subscription(Base):
-    """История подписок пользователя на рассылку."""
-
-    __tablename__ = "subscriptions"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(Integer, nullable=False)
-    subscribed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("now()"),
-        nullable=True,
-    )
-    unsubscribed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        nullable=True,
-    )
+        return f"{self.platform}:{self.platform_user_id}"
 
 
-class DialogSession(Base):
-    """Сессия диалога пользователя."""
+class DifyMessage(Base):
+    """Ответ Dify, показанный пользователю; к нему привязывается оценка."""
 
-    __tablename__ = "sessions"
+    __tablename__ = "dify_messages"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
-    state: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    started_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("now()"),
-        nullable=True,
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
-    last_message_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("now()"),
-        nullable=True,
-    )
-
-
-class DialogMessage(Base):
-    """Сообщение внутри пользовательской сессии."""
-
-    __tablename__ = "messages"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    session_id: Mapped[int] = mapped_column(ForeignKey("sessions.id"), nullable=False)
-    role: Mapped[str] = mapped_column(String(10), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
-    model_used: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    used_chunk_ids: Mapped[list[str] | None] = mapped_column(ARRAY(String), nullable=True)
+    dify_conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    dify_message_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    question: Mapped[str] = mapped_column(Text, nullable=False)
+    answer: Mapped[str] = mapped_column(Text, nullable=False)
     feedback: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    normalized_query: Mapped[str | None] = mapped_column(Text, nullable=True)
-    question_type: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    created_at: Mapped[datetime | None] = mapped_column(
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=text("now()"),
-        nullable=True,
+        nullable=False,
     )
 
 
-class QuestionAnswerLink(Base):
-    """Связка вопроса пользователя и ответа бота."""
+def init_db() -> None:
+    """Создаёт таблицы, если их ещё нет."""
 
-    __tablename__ = "questions_answers"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    question_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False)
-    answer_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), nullable=False)
-    expanded_query: Mapped[str | None] = mapped_column(Text, nullable=True)
-    keywords: Mapped[str | None] = mapped_column(Text, nullable=True)
-    normalized_context: Mapped[str | None] = mapped_column(Text, nullable=True)
-    relevance_type: Mapped[str | None] = mapped_column(String(1), nullable=True)
-    relevant_sources: Mapped[str | None] = mapped_column(Text, nullable=True)
-    source_links: Mapped[list[dict] | None] = mapped_column(JSON, nullable=True)
-    created_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("now()"),
-        nullable=True,
-    )
-
-
-class Holiday(Base):
-    """Праздник из таблицы holidays."""
-
-    __tablename__ = "holidays"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    name: Mapped[str] = mapped_column(String(255), nullable=False)
-    date: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
-    month: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    day_of_month: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    type: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    male_holiday: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    female_holiday: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    template_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
-
-
-class TelemetryLog(Base):
-    """Технический лог для внутренних фоновых процессов."""
-
-    __tablename__ = "telemetry_logs"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    timestamp: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True),
-        server_default=text("now()"),
-        nullable=True,
-    )
-    level: Mapped[str | None] = mapped_column(String(10), nullable=True)
-    request_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    service: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    payload: Mapped[str | None] = mapped_column(Text, nullable=True)
+    Base.metadata.create_all(engine)
 
 
 def get_session() -> Session:

@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,7 +27,8 @@ type Settings struct {
 	MaxBotToken               string
 	BotCoreURL                string
 	BotCoreTimeoutSeconds     time.Duration
-	InternalPort              string
+	MaxAPIURL                 string
+	MaxConcurrentUpdates      int
 	RequestDelayAfterFailures time.Duration
 }
 
@@ -54,12 +56,12 @@ type CallbackEvent struct {
 
 // OutgoingAction описывает действие, которое должен выполнить адаптер.
 type OutgoingAction struct {
-	Type          string                `json:"type"`
-	Text          string                `json:"text,omitempty"`
-	ParseMode     string                `json:"parse_mode,omitempty"`
-	Buttons       [][]InlineButton      `json:"buttons,omitempty"`
+	Type          string                  `json:"type"`
+	Text          string                  `json:"text,omitempty"`
+	ParseMode     string                  `json:"parse_mode,omitempty"`
+	Buttons       [][]InlineButton        `json:"buttons,omitempty"`
 	ReplyKeyboard [][]ReplyKeyboardButton `json:"reply_keyboard,omitempty"`
-	Metadata      map[string]any        `json:"metadata,omitempty"`
+	Metadata      map[string]any          `json:"metadata,omitempty"`
 }
 
 // BotResponse описывает ответ core-сервиса.
@@ -79,13 +81,6 @@ type ReplyKeyboardButton struct {
 	Text string `json:"text"`
 }
 
-// InternalSendRequest описывает внутренний запрос на отправку сообщения через MAX-адаптер.
-type InternalSendRequest struct {
-	UserID string `json:"user_id,omitempty"`
-	ChatID string `json:"chat_id,omitempty"`
-	Text   string `json:"text"`
-}
-
 // CoreClient отправляет нормализованные сообщения в общий core.
 type CoreClient struct {
 	baseURL string
@@ -94,7 +89,7 @@ type CoreClient struct {
 
 // NewSettings считывает настройки из переменных окружения.
 func NewSettings() Settings {
-	timeoutSeconds := 10 * time.Second
+	timeoutSeconds := 300 * time.Second
 	if rawTimeout := os.Getenv("BOT_CORE_TIMEOUT_SECONDS"); rawTimeout != "" {
 		if parsedTimeout, err := time.ParseDuration(rawTimeout + "s"); err == nil {
 			timeoutSeconds = parsedTimeout
@@ -105,7 +100,8 @@ func NewSettings() Settings {
 		MaxBotToken:               os.Getenv("MAX_BOT_TOKEN"),
 		BotCoreURL:                valueOrDefault(os.Getenv("BOT_CORE_URL"), "http://127.0.0.1:8000"),
 		BotCoreTimeoutSeconds:     timeoutSeconds,
-		InternalPort:              valueOrDefault(os.Getenv("MAX_BOT_INTERNAL_PORT"), "8081"),
+		MaxAPIURL:                 valueOrDefault(os.Getenv("MAX_API_URL"), "https://platform-api.max.ru"),
+		MaxConcurrentUpdates:      32,
 		RequestDelayAfterFailures: 2 * time.Second,
 	}
 }
@@ -213,39 +209,44 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
-	api, err := maxbot.New(settings.MaxBotToken)
+	api, err := maxbot.New(settings.MaxBotToken, maxbot.WithBaseURL(strings.TrimRight(settings.MaxAPIURL, "/")+"/"))
 	if err != nil {
 		log.Fatalf("не удалось создать MAX API клиент: %v", err)
 	}
 
 	coreClient := NewCoreClient(settings)
+	messenger := NewMessenger(api, settings)
+	messenger.RegisterCommands(ctx)
 
-	server := startInternalServer(ctx, settings, api)
-	defer func() {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("ошибка остановки internal MAX server: %v", err)
-		}
-	}()
-
+	// Обновления обрабатываются параллельно: ответ Dify может идти десятки
+	// секунд, и один долгий вопрос не должен задерживать остальных пользователей.
+	// Очерёдность вопросов одного пользователя обеспечивает bot-core.
+	slots := make(chan struct{}, settings.MaxConcurrentUpdates)
+	var wg sync.WaitGroup
 	for update := range api.GetUpdates(ctx) {
-		if err := handleUpdate(ctx, api, coreClient, update); err != nil {
-			log.Printf("ошибка обработки MAX update: %v", err)
-			time.Sleep(settings.RequestDelayAfterFailures)
-		}
+		slots <- struct{}{}
+		wg.Add(1)
+		go func(update any) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			if err := handleUpdate(ctx, messenger, coreClient, update); err != nil {
+				log.Printf("ошибка обработки MAX update: %v", err)
+				time.Sleep(settings.RequestDelayAfterFailures)
+			}
+		}(update)
 	}
+	wg.Wait()
 }
 
 // handleUpdate обрабатывает только текстовые сообщения и пересылает их в core.
 func handleUpdate(
 	ctx context.Context,
-	api *maxbot.Api,
+	messenger *Messenger,
 	coreClient *CoreClient,
 	update any,
 ) error {
 	if callbackUpdate, ok := update.(*schemes.MessageCallbackUpdate); ok {
-		return handleCallbackUpdate(ctx, api, coreClient, callbackUpdate)
+		return handleCallbackUpdate(ctx, messenger, coreClient, callbackUpdate)
 	}
 
 	messageUpdate, ok := update.(*schemes.MessageCreatedUpdate)
@@ -258,6 +259,7 @@ func handleUpdate(
 		return err
 	}
 
+	pendingMID := ""
 	if shouldShowPendingMessage(payload) {
 		var chatID int64
 		var userID int64
@@ -269,16 +271,16 @@ func handleUpdate(
 		}
 
 		if userID != 0 || chatID != 0 {
-			_ = sendMessage(ctx, api, userID, chatID,
+			pendingMID = messenger.SendTemporary(ctx, userID, chatID,
 				"Сейчас я попробую ответить на этот вопрос, это может занять какое-то время...",
-				nil,
 			)
 		}
 	}
 
 	response, err := coreClient.ProcessMessage(ctx, payload)
+	messenger.Delete(ctx, pendingMID)
 	if err != nil {
-		if sendErr := sendFallbackMessage(ctx, api, messageUpdate); sendErr != nil {
+		if sendErr := sendFallbackMessage(ctx, messenger, messageUpdate); sendErr != nil {
 			return errors.Join(err, sendErr)
 		}
 		return err
@@ -310,7 +312,7 @@ func handleUpdate(
 			buttons = convertReplyToInline(action.ReplyKeyboard)
 		}
 
-		if err := sendMessage(ctx, api, userID, chatID, text, buttons); err != nil {
+		if err := messenger.Send(ctx, userID, chatID, text, buttons); err != nil {
 			return fmt.Errorf("не удалось отправить ответ в MAX: %w", err)
 		}
 	}
@@ -320,7 +322,7 @@ func handleUpdate(
 
 func handleCallbackUpdate(
 	ctx context.Context,
-	api *maxbot.Api,
+	messenger *Messenger,
 	coreClient *CoreClient,
 	update *schemes.MessageCallbackUpdate,
 ) error {
@@ -353,7 +355,7 @@ func handleCallbackUpdate(
 			text = stripHTMLToPlain(text)
 		}
 
-		if err := sendMessage(ctx, api, userID, chatID, text, action.Buttons); err != nil {
+		if err := messenger.Send(ctx, userID, chatID, text, action.Buttons); err != nil {
 			return fmt.Errorf("не удалось отправить callback ответ в MAX: %w", err)
 		}
 	}
@@ -446,7 +448,7 @@ func buildCallbackEvent(update *schemes.MessageCallbackUpdate) (CallbackEvent, e
 // sendFallbackMessage отправляет короткий ответ, если core временно недоступен.
 func sendFallbackMessage(
 	ctx context.Context,
-	api *maxbot.Api,
+	messenger *Messenger,
 	update *schemes.MessageCreatedUpdate,
 ) error {
 	var chatID int64
@@ -460,123 +462,11 @@ func sendFallbackMessage(
 		return fmt.Errorf("некуда отправить fallback-сообщение MAX")
 	}
 
-	if err := sendMessage(ctx, api, userID, chatID, "Сервис временно недоступен.", nil); err != nil {
+	if err := messenger.Send(ctx, userID, chatID, "Сервис временно недоступен.", nil); err != nil {
 		return fmt.Errorf("не удалось отправить fallback-сообщение MAX: %w", err)
 	}
 
 	return nil
-}
-
-func sendMessage(
-	ctx context.Context,
-	api *maxbot.Api,
-	userID int64,
-	chatID int64,
-	text string,
-	buttons [][]InlineButton,
-) error {
-	if text == "" {
-		return fmt.Errorf("пустой текст сообщения для отправки")
-	}
-
-	message := maxbot.NewMessage()
-	message.SetText(text)
-	addKeyboardToMessage(message, buttons)
-
-	switch {
-	case chatID != 0:
-		message.SetChat(chatID)
-	case userID != 0:
-		message.SetUser(userID)
-	default:
-		return fmt.Errorf("не указан chat_id или user_id для отправки")
-	}
-
-	if err := api.Messages.Send(ctx, message); err != nil {
-		return err
-	}
-	return nil
-}
-
-func startInternalServer(ctx context.Context, settings Settings, api *maxbot.Api) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/internal/send", func(writer http.ResponseWriter, request *http.Request) {
-		handleInternalSend(writer, request, api)
-	})
-
-	server := &http.Server{
-		Addr:    ":" + settings.InternalPort,
-		Handler: mux,
-	}
-
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("ошибка остановки internal MAX server: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Printf("internal MAX server started on :%s", settings.InternalPort)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("ошибка запуска internal MAX server: %v", err)
-		}
-	}()
-
-	return server
-}
-
-func handleInternalSend(
-	writer http.ResponseWriter,
-	request *http.Request,
-	api *maxbot.Api,
-) {
-	if request.Method != http.MethodPost {
-		http.Error(writer, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var payload InternalSendRequest
-	if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-		http.Error(writer, "invalid json body", http.StatusBadRequest)
-		return
-	}
-
-	var userID int64
-	var chatID int64
-	var err error
-
-	if payload.UserID != "" {
-		userID, err = strconv.ParseInt(payload.UserID, 10, 64)
-		if err != nil {
-			http.Error(writer, "invalid user_id", http.StatusBadRequest)
-			return
-		}
-	}
-	if payload.ChatID != "" {
-		chatID, err = strconv.ParseInt(payload.ChatID, 10, 64)
-		if err != nil {
-			http.Error(writer, "invalid chat_id", http.StatusBadRequest)
-			return
-		}
-	}
-
-	if payload.Text == "" {
-		http.Error(writer, "text is required", http.StatusBadRequest)
-		return
-	}
-
-	if err := sendMessage(request.Context(), api, userID, chatID, payload.Text, nil); err != nil {
-		http.Error(writer, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	writer.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(writer).Encode(map[string]any{
-		"ok": true,
-	})
 }
 
 func parseOptionalInt64(value string) (int64, error) {
@@ -689,10 +579,10 @@ func addKeyboardToMessage(message *maxbot.Message, rows [][]InlineButton) {
 
 // detectButtonIntent подбирает визуальный intent для inline-кнопки.
 func detectButtonIntent(callbackData string) schemes.Intent {
-	switch callbackData {
-	case "feedback:like":
+	switch {
+	case strings.HasPrefix(callbackData, "feedback:like"):
 		return schemes.POSITIVE
-	case "feedback:dislike":
+	case strings.HasPrefix(callbackData, "feedback:dislike"):
 		return schemes.NEGATIVE
 	default:
 		return schemes.DEFAULT
@@ -707,12 +597,13 @@ func shouldShowPendingMessage(msg IncomingMessage) bool {
 
 	normalized := strings.TrimSpace(strings.ToLower(msg.Text))
 	excluded := map[string]bool{
-		"/start":          true,
-		"start":           true,
-		"начать":          true,
+		"/start":         true,
+		"start":          true,
+		"начать":         true,
 		"📋 помощь":       true,
 		"🔄 новый диалог": true,
-		"🔔 рассылка":     true,
+		"/new":           true,
+		"/help":          true,
 	}
 
 	return !excluded[normalized]
@@ -729,9 +620,8 @@ func stripHTMLToPlain(text string) string {
 // с корректными callback_data для обработки в core.
 func convertReplyToInline(rows [][]ReplyKeyboardButton) [][]InlineButton {
 	buttonMapping := map[string]string{
-		"📋 Помощь":      "menu:help",
+		"📋 Помощь":       "menu:help",
 		"🔄 Новый диалог": "menu:new_dialog",
-		"🔔 Рассылка":    "menu:subscription",
 	}
 
 	var result [][]InlineButton

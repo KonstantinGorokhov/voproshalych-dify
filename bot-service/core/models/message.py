@@ -10,7 +10,6 @@ from pydantic import BaseModel, Field
 class Platform(str, Enum):
     """Поддерживаемые платформы ботов."""
 
-    telegram = "telegram"
     vk = "vk"
     max = "max"
 

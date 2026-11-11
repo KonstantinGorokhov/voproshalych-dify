@@ -4,7 +4,7 @@ WORKDIR /src
 
 COPY bots/max/go.mod /src/go.mod
 COPY bots/max/go.sum /src/go.sum
-COPY bots/max/main.go /src/main.go
+COPY bots/max/*.go /src/
 
 RUN go mod download
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/max-bot .

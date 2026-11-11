@@ -1,7 +1,16 @@
-"""Точка входа в бизнес-логику для обработки нормализованных сообщений."""
+"""Точка входа в бизнес-логику для обработки нормализованных сообщений.
+
+Ответы формирует Chatflow-приложение Dify. bot-core хранит связку
+«пользователь мессенджера → conversation_id в Dify», управляет новым
+диалогом и пересылает оценки ответов.
+"""
+
+from __future__ import annotations
 
 import logging
 import re
+import threading
+from collections import defaultdict
 
 from config import settings
 from messages import (
@@ -13,483 +22,63 @@ from messages import (
     GREETING,
     HELP_CONTACTS,
     SERVICE_UNAVAILABLE,
-    SUBSCRIBED,
-    SUBSCRIPTION_ERROR,
-    UNSUBSCRIBED,
-    UNSUPPORTED_FORMAT,
     UNKNOWN_COMMAND,
+    UNSUPPORTED_FORMAT,
     VOICE_STUB,
 )
 from models.callback import CallbackEvent
 from models.message import IncomingMessage
-from models.response import ActionType, BotResponse, InlineButton, KeyboardButton, OutgoingAction
-from services.dialog_service import DialogService
-from services.feedback_service import FeedbackService, FEEDBACK_LIKE as FEEDBACK_LIKE_TYPE, FEEDBACK_DISLIKE as FEEDBACK_DISLIKE_TYPE
-from services.holiday_newsletter import HolidayNewsletterService
-from services.qa_service_client import QAServiceClient
+from models.response import ActionType, BotResponse, InlineButton, OutgoingAction
+from services.dify_client import (
+    DifyAnswer,
+    DifyClient,
+    DifyConversationNotFound,
+    DifyError,
+)
+from services.feedback_service import (
+    FEEDBACK_DISLIKE as FEEDBACK_DISLIKE_TYPE,
+    FEEDBACK_LIKE as FEEDBACK_LIKE_TYPE,
+    FeedbackService,
+)
 from services.user_service import UserService
 
 logger = logging.getLogger(__name__)
 
+MAX_ANSWER_LENGTH = 3900
+NEW_DIALOG_TEXTS = {"🔄 новый диалог", "новый диалог", "/new"}
+HELP_TEXTS = {"/help", "📋 помощь", "помощь"}
+START_TEXTS = {"/start", "start", "начать"}
+
+
+class _UserLocks:
+    """Блокировки на пользователя: вопросы одного пользователя идут по очереди.
+
+    Без этого два быстрых вопроса подряд в новом диалоге создадут в Dify два
+    разных диалога, потому что conversation_id известен только после ответа.
+    Работает в пределах одного процесса uvicorn.
+    """
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._locks: dict[int, threading.Lock] = defaultdict(threading.Lock)
+
+    def get(self, user_id: int) -> threading.Lock:
+        with self._guard:
+            return self._locks[user_id]
+
+
+def _text(text: str, buttons: list[list[InlineButton]] | None = None) -> BotResponse:
+    """Ответ из одного текстового сообщения."""
+
+    return BotResponse(
+        actions=[
+            OutgoingAction(type=ActionType.send_text, text=text, buttons=buttons or [])
+        ]
+    )
+
 
 class BotService:
     """Обрабатывает нормализованные сообщения и возвращает платформенно-независимые действия."""
-
-    def __init__(self) -> None:
-        """Инициализирует зависимости бизнес-логики."""
-
-        self._qa_service_client = QAServiceClient(
-            base_url=settings.qa_service_url,
-            timeout_seconds=settings.qa_service_timeout_seconds,
-        )
-        self._dialog_service = DialogService()
-        self._feedback_service = FeedbackService()
-        self._FEEDBACK_LIKE = FEEDBACK_LIKE_TYPE
-        self._FEEDBACK_DISLIKE = FEEDBACK_DISLIKE_TYPE
-        self._holiday_newsletter_service = HolidayNewsletterService(
-            qa_service_client=self._qa_service_client
-        )
-        self._user_service = UserService()
-
-    def handle_message(self, message: IncomingMessage) -> BotResponse:
-        """Обрабатывает сообщение и возвращает действия для адаптера платформы.
-
-        Args:
-            message: Нормализованное входящее сообщение от адаптера платформы.
-
-        Returns:
-            BotResponse: Действия, которые нужно выполнить на исходной платформе.
-        """
-
-        user = self._user_service.upsert_user(message)
-
-        if message.message_type == "text":
-            return self._handle_text_message(message, user)
-        if message.message_type == "voice":
-            return self._handle_voice_message(message)
-        return self._build_unsupported_message_response(message)
-
-    def handle_callback(self, event: CallbackEvent) -> BotResponse:
-        """Обрабатывает callback-событие платформы.
-
-        Args:
-            event: Нормализованное callback-событие.
-
-        Returns:
-            BotResponse: Ответ для callback-события.
-        """
-
-        if event.callback_data == "subscription:toggle" or event.callback_data == "menu:subscription":
-            user = self._user_service.toggle_subscription(event)
-            if user is None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SUBSCRIPTION_ERROR,
-                        )
-                    ]
-                )
-
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=SUBSCRIBED if user.is_subscribed else UNSUBSCRIBED,
-                        buttons=self._build_start_buttons(user.is_subscribed),
-                    )
-                ]
-            )
-
-        if event.callback_data == "menu:help":
-            return self._build_help_response()
-
-        if event.callback_data == "dialog:start_new" or event.callback_data == "menu:new_dialog":
-            user = self._user_service.get_user(event.platform.value, event.user_id)
-            if user is None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SERVICE_UNAVAILABLE,
-                        )
-                    ]
-                )
-
-            dialog_session = self._dialog_service.start_new_dialog(user.id)
-            if dialog_session is None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SERVICE_UNAVAILABLE,
-                        )
-                    ]
-                )
-
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=DIALOG_RESET,
-                    )
-                ]
-            )
-
-        if event.callback_data == "feedback:like":
-            result = self._feedback_service.save_feedback(
-                event.platform.value, event.user_id, self._FEEDBACK_LIKE,
-            )
-            if result == "already_rated":
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=FEEDBACK_ALREADY_RATED,
-                        )
-                    ]
-                )
-            if result is not None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SERVICE_UNAVAILABLE,
-                        )
-                    ]
-                )
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=FEEDBACK_LIKE,
-                    )
-                ]
-            )
-
-        if event.callback_data == "feedback:dislike":
-            result = self._feedback_service.save_feedback(
-                event.platform.value, event.user_id, self._FEEDBACK_DISLIKE,
-            )
-            if result == "already_rated":
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=FEEDBACK_ALREADY_RATED,
-                        )
-                    ]
-                )
-            if result is not None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SERVICE_UNAVAILABLE,
-                        )
-                    ]
-                )
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=FEEDBACK_DISLIKE,
-                    )
-                ]
-            )
-
-        return BotResponse(actions=[])
-
-    def send_today_holiday_newsletter(self) -> dict[str, object]:
-        """Запускает праздничную рассылку за текущую дату.
-
-        Returns:
-            dict[str, object]: Сводка по отправке.
-        """
-
-        result = self._holiday_newsletter_service.send_today_newsletter()
-        return {
-            "holiday_name": result.holiday_name,
-            "generated_message": result.generated_message,
-            "sent_count": result.sent_count,
-            "skipped_count": result.skipped_count,
-            "failed_count": result.failed_count,
-            "details": result.details,
-        }
-
-    def _handle_text_message(self, message: IncomingMessage, user) -> BotResponse:
-        """Обрабатывает текстовое сообщение.
-
-        Args:
-            message: Нормализованное текстовое сообщение.
-            user: Текущий пользователь из БД.
-
-        Returns:
-            BotResponse: Ответ для текстового сообщения.
-        """
-
-        normalized_text = (message.text or "").strip()
-        lowered_text = normalized_text.lower()
-
-        if lowered_text == "/start":
-            return self._build_start_response(message, user)
-        if lowered_text in ("/help", "📋 помощь"):
-            return self._build_help_response()
-        if lowered_text in ("🔄 новый диалог",):
-            if user is not None:
-                self._dialog_service.start_new_dialog(user.id)
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=DIALOG_RESET,
-                    )
-                ]
-            )
-        if lowered_text in ("🔔 рассылка",):
-            from models.callback import CallbackEvent as CBEvent
-            fake_event = CBEvent(
-                platform=message.platform,
-                user_id=message.user_id,
-                chat_id=message.chat_id,
-                callback_data="subscription:toggle",
-            )
-            toggled_user = self._user_service.toggle_subscription(fake_event)
-            if toggled_user is not None:
-                return BotResponse(
-                    actions=[
-                        OutgoingAction(
-                            type=ActionType.send_text,
-                            text=SUBSCRIBED if toggled_user.is_subscribed else UNSUBSCRIBED,
-                        )
-                    ]
-                )
-            return BotResponse(
-                actions=[
-                    OutgoingAction(
-                        type=ActionType.send_text,
-                        text=SUBSCRIPTION_ERROR,
-                    )
-                ]
-            )
-        if self._is_service_command(lowered_text):
-            return self._build_service_command_response()
-
-        reply_text, source_buttons = self._handle_dialog_message(normalized_text, user)
-
-        feedback_buttons = self._build_feedback_buttons()
-
-        all_buttons = feedback_buttons
-        if source_buttons:
-            all_buttons = source_buttons + all_buttons
-
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=reply_text,
-                    buttons=all_buttons,
-                )
-            ]
-        )
-
-    def _handle_dialog_message(
-        self, question: str, user
-    ) -> tuple[str, list[list[InlineButton]]]:
-        """Обрабатывает пользовательский вопрос с учетом истории диалога.
-
-        Args:
-            question: Текущий вопрос пользователя.
-            user: Текущий пользователь из БД.
-
-        Returns:
-            Кортеж (текст ответа, inline-кнопки источников).
-        """
-
-        if user is None:
-            qa_result = self._ask_qa_service(question)
-            return self._format_qa_answer(qa_result)
-
-        dialog_session = self._dialog_service.get_or_create_active_session(user.id)
-        if dialog_session is None:
-            qa_result = self._ask_qa_service(question)
-            return self._format_qa_answer(qa_result)
-
-        history = self._dialog_service.build_context(
-            session_id=dialog_session.id,
-        )
-        qa_result = self._ask_qa_service(
-            question=question,
-            context=history or None,
-        )
-        self._dialog_service.save_question_answer(
-                session_id=dialog_session.id,
-                question=question,
-                answer=qa_result.get("answer", ""),
-                expanded_query=qa_result.get("expanded_query"),
-                keywords=qa_result.get("keywords"),
-                model_used=qa_result.get("model"),
-                question_type=qa_result.get("question_type"),
-                normalized_context=qa_result.get("context_expanded_query"),
-                relevance_type=qa_result.get("relevance_type"),
-                relevant_sources=qa_result.get("relevant_sources"),
-                source_links=qa_result.get("sources"),
-            )
-        return self._format_qa_answer(qa_result)
-
-    def _handle_voice_message(self, message: IncomingMessage) -> BotResponse:
-        """Обрабатывает голосовое сообщение.
-
-        Args:
-            message: Нормализованное голосовое сообщение.
-
-        Returns:
-            BotResponse: Заглушка до интеграции STT.
-        """
-
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=VOICE_STUB,
-                )
-            ]
-        )
-
-    def _build_unsupported_message_response(
-        self,
-        message: IncomingMessage,
-    ) -> BotResponse:
-        """Возвращает ответ для неподдерживаемого типа сообщения.
-
-        Args:
-            message: Нормализованное входящее сообщение.
-
-        Returns:
-            BotResponse: Сообщение о неподдерживаемом формате.
-        """
-
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=UNSUPPORTED_FORMAT,
-                )
-            ]
-        )
-
-    def _ask_qa_service(self, question: str, context: str | None = None) -> dict:
-        """Отправляет вопрос в QA-сервис и возвращает полный ответ.
-
-        Args:
-            question: Текст вопроса пользователя.
-            context: История диалога или другой дополнительный контекст.
-
-        Returns:
-            dict: Ответ с ключами answer, expanded_query, keywords, model,
-            sources, question_type, relevant_sources.
-        """
-        from services.qa_service_client import (
-            QAServiceError,
-            QAServiceRateLimited,
-            QAServiceTimeout,
-            QAServiceUnavailable,
-        )
-
-        try:
-            logger.info(
-                f"Sending to QA: question='{question[:80]}', "
-                f"context_len={len(context or '')}"
-            )
-            result = self._qa_service_client.ask(question=question, context=context)
-            logger.info(
-                f"QA response: answer_len={len(result.get('answer', ''))}, "
-                f"type={result.get('question_type')}, "
-                f"sources={len(result.get('sources', []))}"
-            )
-            return result
-        except (QAServiceTimeout, QAServiceUnavailable, QAServiceRateLimited, QAServiceError) as e:
-            logger.error(f"QA service error: {type(e).__name__}: {e}")
-            return {"answer": SERVICE_UNAVAILABLE}
-        except Exception as e:
-            logger.error(f"Unexpected QA error: {e}")
-            return {"answer": ANSWER_FAILED}
-
-    def _format_qa_answer(
-        self, qa_result: dict
-    ) -> tuple[str, list[list[InlineButton]]]:
-        """Форматирует ответ QA для отправки в мессенджер.
-
-        Формирует inline-кнопки с URL из sources (SourceLink).
-        Кнопки добавляются только если sources не пустой.
-
-        Args:
-            qa_result: Ответ от QA-сервиса.
-
-        Returns:
-            Кортеж (отформатированный текст, inline-кнопки источников).
-        """
-        answer = qa_result.get("answer", "")
-        sources = qa_result.get("sources", [])
-
-        answer = self._strip_remaining_markdown(answer)
-
-        source_buttons: list[list[InlineButton]] = []
-
-        if sources:
-            for src in sources[:3]:
-                if isinstance(src, dict):
-                    url = src.get("url", "")
-                    label = src.get("label", "Подробнее")
-                else:
-                    url = str(src)
-                    label = "Подробнее"
-                if url:
-                    source_buttons.append(
-                        [InlineButton(text=label, url=url)]
-                    )
-
-        if len(answer) > 3900:
-            answer = answer[:3850] + "\n\n..."
-
-        return answer, source_buttons
-
-    def _strip_remaining_markdown(self, text: str) -> str:
-        """Удалить оставшийся markdown (safety-net после qa-service)."""
-        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-        text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
-        text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return text.strip()
-
-    def _is_service_command(self, normalized_text: str) -> bool:
-        """Определяет, является ли сообщение сервисной slash-командой.
-
-        Args:
-            normalized_text: Нормализованный текст сообщения.
-
-        Returns:
-            bool: `True`, если это сервисная команда.
-        """
-
-        return normalized_text.startswith("/")
-
-    def _build_service_command_response(self) -> BotResponse:
-        """Возвращает ответ для неподдерживаемой сервисной команды.
-
-        Returns:
-            BotResponse: Сервисный ответ без сохранения в историю.
-        """
-
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=UNKNOWN_COMMAND,
-                )
-            ]
-        )
 
     SOURCE_URL_BUTTONS: list[list[InlineButton]] = [
         [InlineButton(text="🌐 Официальный сайт ТюмГУ", url="https://utmn.ru")],
@@ -498,89 +87,195 @@ class BotService:
         [InlineButton(text="📚 Руководства для обучающихся", url="https://confluence.utmn.ru/pages/viewpage.action?pageId=86478972")],
     ]
 
-    def _build_start_response(self, message: IncomingMessage, user) -> BotResponse:
-        """Возвращает стартовое сообщение и базовые inline-кнопки.
-
-        Args:
-            message: Нормализованное входящее сообщение.
-            user: Текущий пользователь из БД.
-
-        Returns:
-            BotResponse: Ответ для команды `/start`.
-        """
-
-        is_subscribed = bool(user.is_subscribed) if user is not None else False
-
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=GREETING,
-                    buttons=self._build_start_buttons(is_subscribed),
-                ),
-            ]
+    def __init__(self, dify_client: DifyClient | None = None) -> None:
+        self._dify = dify_client or DifyClient(
+            base_url=settings.dify_api_url,
+            api_key=settings.dify_api_key,
+            timeout_seconds=settings.dify_timeout_seconds,
+            source_url_field=settings.dify_source_url_field,
         )
+        self._user_service = UserService()
+        self._feedback_service = FeedbackService()
+        self._locks = _UserLocks()
+
+    # ------------------------------------------------------------------ входящие
+
+    def handle_message(self, message: IncomingMessage) -> BotResponse:
+        """Обрабатывает сообщение и возвращает действия для адаптера платформы."""
+
+        user = self._user_service.upsert_user(message)
+
+        if message.message_type == "text":
+            return self._handle_text_message(message, user)
+        if message.message_type == "voice":
+            return _text(VOICE_STUB)
+        return _text(UNSUPPORTED_FORMAT)
+
+    def handle_callback(self, event: CallbackEvent) -> BotResponse:
+        """Обрабатывает нажатие inline-кнопки."""
+
+        data = event.callback_data
+
+        if data == "menu:help":
+            return self._build_help_response()
+
+        if data in ("dialog:start_new", "menu:new_dialog"):
+            user = self._user_service.get_user(event.platform.value, event.user_id)
+            if user is None or not self._user_service.set_conversation_id(user.id, None):
+                return _text(SERVICE_UNAVAILABLE)
+            return _text(DIALOG_RESET)
+
+        if data.startswith("feedback:"):
+            return self._handle_feedback(event)
+
+        return BotResponse(actions=[])
+
+    # ------------------------------------------------------------------ текст
+
+    def _handle_text_message(self, message: IncomingMessage, user) -> BotResponse:
+        """Обрабатывает текстовое сообщение: команды меню или вопрос в Dify."""
+
+        normalized_text = (message.text or "").strip()
+        lowered_text = normalized_text.lower()
+
+        if lowered_text in START_TEXTS:
+            return _text(GREETING, self._build_start_buttons())
+        if lowered_text in HELP_TEXTS:
+            return self._build_help_response()
+        if lowered_text in NEW_DIALOG_TEXTS:
+            if user is not None:
+                self._user_service.set_conversation_id(user.id, None)
+            return _text(DIALOG_RESET)
+        if lowered_text.startswith("/"):
+            return _text(UNKNOWN_COMMAND)
+        if not normalized_text:
+            return _text(UNSUPPORTED_FORMAT)
+
+        return self._answer_question(normalized_text, user)
+
+    def _answer_question(self, question: str, user) -> BotResponse:
+        """Задаёт вопрос в Dify в рамках текущего диалога пользователя."""
+
+        if user is None:
+            # БД недоступна: без сохранения диалога ответить можно, но без контекста.
+            logger.warning("Answering without user record")
+            try:
+                result = self._dify.chat(query=question, user="anonymous")
+            except DifyError:
+                return _text(SERVICE_UNAVAILABLE)
+            return _text(*self._format_answer(result, answer_id=None))
+
+        with self._locks.get(user.id):
+            # Читаем conversation_id внутри блокировки: предыдущий вопрос мог его обновить.
+            conversation_id = self._user_service.get_conversation_id(user.id)
+            try:
+                result = self._ask(question, user.dify_user, conversation_id)
+            except DifyError as exc:
+                logger.error("Dify error: %s: %s", type(exc).__name__, exc)
+                return _text(SERVICE_UNAVAILABLE)
+            except Exception:
+                logger.exception("Unexpected Dify error")
+                return _text(ANSWER_FAILED)
+
+            if result.conversation_id and result.conversation_id != conversation_id:
+                self._user_service.set_conversation_id(user.id, result.conversation_id)
+
+            answer_id = None
+            if result.message_id:
+                answer_id = self._feedback_service.save_answer(
+                    user_id=user.id,
+                    conversation_id=result.conversation_id,
+                    dify_message_id=result.message_id,
+                    question=question,
+                    answer=result.answer,
+                )
+
+        return _text(*self._format_answer(result, answer_id=answer_id))
+
+    def _ask(self, question: str, dify_user: str, conversation_id: str | None) -> DifyAnswer:
+        """Запрос в Dify; если сохранённый диалог пропал — начинает новый."""
+
+        try:
+            return self._dify.chat(
+                query=question, user=dify_user, conversation_id=conversation_id
+            )
+        except DifyConversationNotFound:
+            logger.info("Conversation %s not found in Dify, starting new", conversation_id)
+            return self._dify.chat(query=question, user=dify_user, conversation_id=None)
+
+    def _format_answer(
+        self, result: DifyAnswer, answer_id: int | None
+    ) -> tuple[str, list[list[InlineButton]]]:
+        """Готовит текст ответа и кнопки (источники + оценка)."""
+
+        answer = self._strip_markdown(result.answer) or ANSWER_FAILED
+        if len(answer) > MAX_ANSWER_LENGTH:
+            answer = answer[: MAX_ANSWER_LENGTH - 50] + "\n\n..."
+
+        buttons = [[InlineButton(text=s.label, url=s.url)] for s in result.sources[:3]]
+        if answer_id is not None:
+            buttons.append(
+                [
+                    InlineButton(text="❤️", callback_data=f"feedback:like:{answer_id}"),
+                    InlineButton(text="👎", callback_data=f"feedback:dislike:{answer_id}"),
+                ]
+            )
+        return answer, buttons
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Убирает markdown: VK и MAX показывают ответ обычным текстом."""
+
+        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+        text = re.sub(r"__(.+?)__", r"\1", text)
+        text = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", text)
+        text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    # ------------------------------------------------------------------ оценки
+
+    def _handle_feedback(self, event: CallbackEvent) -> BotResponse:
+        """Обрабатывает `feedback:<like|dislike>[:<answer_id>]`."""
+
+        parts = event.callback_data.split(":")
+        rating = parts[1] if len(parts) > 1 else ""
+        if rating not in (FEEDBACK_LIKE_TYPE, FEEDBACK_DISLIKE_TYPE):
+            return BotResponse(actions=[])
+        answer_id = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None
+
+        user = self._user_service.get_user(event.platform.value, event.user_id)
+        if user is None:
+            return _text(SERVICE_UNAVAILABLE)
+
+        result = self._feedback_service.save_feedback(user.id, rating, answer_id)
+        if result.status == "already_rated":
+            return _text(FEEDBACK_ALREADY_RATED)
+        if result.status != "saved":
+            return _text(SERVICE_UNAVAILABLE)
+
+        if result.dify_message_id:
+            try:
+                self._dify.send_feedback(result.dify_message_id, rating, user.dify_user)
+            except DifyError as exc:
+                # Оценка уже сохранена у нас; пользователю ошибку не показываем.
+                logger.warning("Failed to send feedback to Dify: %s", exc)
+
+        return _text(FEEDBACK_LIKE if rating == FEEDBACK_LIKE_TYPE else FEEDBACK_DISLIKE)
+
+    # ------------------------------------------------------------------ меню
 
     def _build_help_response(self) -> BotResponse:
-        """Возвращает справочное сообщение с контактами.
+        """Справочное сообщение с контактами."""
 
-        Returns:
-            BotResponse: Ответ для команды `/help`.
-        """
+        return _text(HELP_CONTACTS, self.SOURCE_URL_BUTTONS)
 
-        return BotResponse(
-            actions=[
-                OutgoingAction(
-                    type=ActionType.send_text,
-                    text=HELP_CONTACTS,
-                    buttons=self.SOURCE_URL_BUTTONS,
-                )
-            ]
-        )
-
-    def _build_start_buttons(self, is_subscribed: bool) -> list[list[InlineButton]]:
-        """Возвращает inline-кнопки стартового сообщения.
-
-        Args:
-            is_subscribed: Текущий статус подписки.
-
-        Returns:
-            list[list[InlineButton]]: Кнопки стартового сообщения.
-        """
-
-        subscription_text = (
-            "Отписаться от рассылки" if is_subscribed else "Подписаться на рассылку"
-        )
+    @staticmethod
+    def _build_start_buttons() -> list[list[InlineButton]]:
+        """Кнопки стартового сообщения."""
 
         return [
             [InlineButton(text="📋 Помощь", callback_data="menu:help")],
             [InlineButton(text="🔄 Новый диалог", callback_data="dialog:start_new")],
-            [InlineButton(text="🔔 Рассылка", callback_data="subscription:toggle")],
-        ]
-
-    def _build_main_keyboard(self) -> list[list[KeyboardButton]]:
-        """Возвращает постоянную reply-клавиатуру под полем ввода.
-
-        Returns:
-            list[list[KeyboardButton]]: Кнопки для быстрого доступа.
-        """
-
-        return [
-            [KeyboardButton(text="📋 Помощь")],
-            [KeyboardButton(text="🔄 Новый диалог")],
-            [KeyboardButton(text="🔔 Рассылка")],
-        ]
-
-    def _build_feedback_buttons(self) -> list[list[InlineButton]]:
-        """Возвращает inline-кнопки для оценки ответа.
-
-        Returns:
-            list[list[InlineButton]]: Кнопки лайка, дизлайка и нового диалога.
-        """
-
-        return [
-            [
-                InlineButton(text="❤️", callback_data="feedback:like"),
-                InlineButton(text="👎", callback_data="feedback:dislike"),
-            ],
         ]

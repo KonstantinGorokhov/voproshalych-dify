@@ -1,83 +1,94 @@
-# Обзор Сервиса
+# bot-service
 
-`bot-service` разделен на общий `bot-core` и платформенные адаптеры.
+Витрина «Вопрошалыча»: принимает сообщения из VK и MAX, задаёт вопрос
+приложению **Chatflow в Dify** и возвращает ответ пользователю. Поиск по базе
+знаний, промпты, LLM и история диалога живут в Dify.
 
 ## Состав
 
-- `core/main.py` — FastAPI приложение `bot-core`
-- `core/services/bot_service.py` — основная бизнес-логика
-- `core/services/user_service.py` — сохранение пользователей и подписок
-- `core/services/dialog_service.py` — сессии диалога и история сообщений
-- `core/services/qa_service_client.py` — клиент к `qa-service`
-- `core/services/holiday_newsletter.py` — праздничная рассылка
+| Каталог | Что делает |
+|---------|------------|
+| `core/` | FastAPI `bot-core`: команды меню, связка пользователь ↔ диалог Dify, оценки |
+| `bots/vk/` | Адаптер VK (`vkbottle`), long polling |
+| `bots/max/` | Адаптер MAX (Go), long polling |
 
-## Что умеет `bot-core`
+Адаптеры ничего не знают про Dify: нормализуют событие платформы и вызывают
+`bot-core`, а затем отрисовывают возвращённые действия (`send_text` + кнопки).
 
-- принимает нормализованные сообщения от Telegram, VK и MAX
-- сохраняет пользователя в БД
-- обрабатывает `/start` и `/ping`
-- поддерживает inline callback-кнопки
-- хранит историю диалога
-- собирает контекст для QA из последних сообщений и передает его в `context`
-- запускает праздничную рассылку вручную и по расписанию
+### HTTP API `bot-core`
 
-## Трассировка По Функциям
+- `GET /health`
+- `POST /messages` — `IncomingMessage` → `BotResponse`
+- `POST /callbacks` — `CallbackEvent` → `BotResponse`
 
-### Обработка сообщения
+## Путь сообщения
 
-1. `core/main.py -> process_message()`
-2. `core/services/bot_service.py -> BotService.handle_message()`
-3. `core/services/user_service.py -> UserService.upsert_user()`
-4. `core/services/bot_service.py -> _handle_text_message()`
-5. `core/services/bot_service.py -> _handle_dialog_message()`
-6. `core/services/dialog_service.py -> get_or_create_active_session()`
-7. `core/services/dialog_service.py -> build_context()`
-8. `core/services/bot_service.py -> _ask_qa_service()`
-9. `core/services/qa_service_client.py -> QAServiceClient.ask()`
-10. `core/services/dialog_service.py -> save_question_answer()`
+1. Адаптер получает сообщение и показывает «Сейчас я попробую ответить…».
+2. `POST /messages` → `BotService.handle_message()`:
+   - `UserService.upsert_user()` — запись в `users` по (`platform`, `platform_user_id`);
+   - `/start`, «📋 Помощь», «🔄 Новый диалог» обрабатываются без Dify;
+   - остальной текст → `_answer_question()`.
+3. `_answer_question()` под блокировкой на пользователя:
+   - читает `users.dify_conversation_id`;
+   - `DifyClient.chat()` → `POST {DIFY_API_URL}/chat-messages`
+     (`response_mode=blocking`, `user="vk:<id>"` / `"max:<id>"`);
+   - если Dify ответил 404 на сохранённый диалог — обнуляет его и повторяет запрос
+     без `conversation_id` (новый диалог);
+   - сохраняет новый `conversation_id` и строку в `dify_messages`.
+4. Ответ очищается от markdown, обрезается до 3900 символов; добавляются кнопки
+   источников (из `retriever_resources`, см. ниже) и оценки
+   `feedback:like:<id>` / `feedback:dislike:<id>`.
 
-### Обработка callback
+Блокировка на пользователя нужна, чтобы два быстрых вопроса подряд не создали в
+Dify два разных диалога (id диалога известен только после первого ответа). Она
+работает в рамках одного процесса uvicorn — не запускайте `bot-core` с
+несколькими воркерами.
 
-1. `core/main.py -> process_callback()`
-2. `core/services/bot_service.py -> BotService.handle_callback()`
-3. `core/services/user_service.py -> toggle_subscription()`
-4. или `core/services/dialog_service.py -> start_new_dialog()`
+## Новый диалог
 
-### Праздничная рассылка
+Кнопка `dialog:start_new` (или текст «🔄 Новый диалог») обнуляет
+`users.dify_conversation_id`. Следующий вопрос уйдёт в Dify без
+`conversation_id`, и Dify создаст новый диалог со своей памятью с нуля.
 
-1. `core/main.py -> send_today_holiday_newsletter()`
-2. `core/services/bot_service.py -> send_today_holiday_newsletter()`
-3. `core/services/holiday_newsletter.py -> send_today_newsletter()`
-4. `core/services/holiday_newsletter.py -> get_today_holiday()`
-5. `core/services/holiday_newsletter.py -> get_subscribed_users()`
-6. `core/services/holiday_newsletter.py -> _build_newsletter_key()`
-7. `core/services/holiday_newsletter.py -> _acquire_newsletter_lock()`
-8. `core/services/qa_service_client.py -> generate_holiday_greeting()`
-9. `core/services/holiday_newsletter.py -> _get_sent_recipient_keys()`
-10. `core/services/holiday_newsletter.py -> _send_to_user()`
-11. для `MAX`: `max-bot -> /internal/send -> handleInternalSend() -> sendMessage()`
-12. `core/services/holiday_newsletter.py -> _mark_delivery_sent()`
-13. `core/services/holiday_newsletter.py -> _mark_summary()`
+### Кнопка в MAX
 
-## Платформенные адаптеры
+В MAX нет клавиатуры у поля ввода (аналога reply-клавиатуры Telegram) — только
+inline-кнопки внутри сообщения. Поэтому адаптер (`bots/max/messenger.go`):
 
-- Telegram: отправка текста, inline-кнопки, callback, временное сообщение ожидания
-- VK: отправка текста, inline-кнопки, временное сообщение ожидания
-- MAX: отправка текста, inline-кнопок и внутренний endpoint для рассылки
+- прикрепляет «🔄 Новый диалог» к каждому сообщению бота;
+- снимает её с предыдущего сообщения бота в этом чате (`PUT /messages`,
+  остальные кнопки — источники и оценки — сохраняются), так что кнопка всегда
+  под последним сообщением;
+- регистрирует команды `/new` и `/help` (`PATCH /me/commands`): MAX показывает их
+  в подсказках при вводе «/», на iOS — ещё и кнопкой в интерфейсе.
+
+Последнее сообщение каждого чата хранится в памяти адаптера: после перезапуска
+на сообщении, отправленном до него, кнопка останется (нажимать её можно).
+
+## Оценки
+
+`feedback:<like|dislike>:<dify_messages.id>` → оценка сохраняется в
+`dify_messages.feedback` и отправляется в Dify
+(`POST /messages/{message_id}/feedbacks`). Отзывы видны в логах приложения Dify.
+Кнопки старого формата без id оценивают последний ответ пользователя.
 
 ## База данных
 
-`bot-core` использует уже существующие таблицы:
+Таблицы создаются при старте `bot-core` (`db.init_db()`):
 
-- `users`
-- `subscriptions`
-- `sessions`
-- `messages`
-- `questions_answers`
-- `holidays`
-- `telemetry_logs`
+- `users` — `platform`, `platform_user_id`, имя, `dify_conversation_id`;
+- `dify_messages` — `user_id`, `dify_conversation_id`, `dify_message_id`,
+  вопрос, ответ, `feedback`.
 
-## Ключевые ограничения
+`create_all` не меняет существующие таблицы: при изменении схемы нужна миграция
+или пересоздание тома.
 
-- контекст диалога собирается в `bot-core` и передается в `qa-service` как `context`
-- для `MAX` рассылка идет через внутренний endpoint адаптера, а не напрямую из `bot-core`
+## Настройка Dify
+
+- Тип приложения — **Chatflow** (blocking-режим; приложения Agent работают только в streaming).
+- `DIFY_API_KEY` — ключ из «Доступ к API» приложения. При смене ключа или
+  приложения сохранённые диалоги станут недоступны — `bot-core` сам начнёт новые.
+- Кнопки «Подробнее»: добавьте документам базы знаний поле метаданных `url`
+  (имя настраивается `DIFY_SOURCE_URL_FIELD`) и включите цитирование в приложении.
+- Таймауты: `DIFY_TIMEOUT_SECONDS` (bot-core → Dify) < `BOT_CORE_TIMEOUT_SECONDS`
+  (адаптер → bot-core). Проверьте таймауты прокси перед Dify.

@@ -25,8 +25,8 @@ test:
   before_script:
     - cp $ENV_PRODUCTION .env
   script:
-    - docker compose run --no-deps --rm -v "$CI_PROJECT_DIR/qa-service/tests:/app/tests:ro" qa-service uv run pytest tests/ -v
-  allow_failure: true
+    - docker compose run --no-deps --rm bot-core sh -c "pip install -q pytest && python -m pytest tests -v"
+    - docker run --rm -v "$CI_PROJECT_DIR/bot-service/bots/max:/src" -w /src golang:1.24 go test ./...
   only:
     - main
   tags:
@@ -38,8 +38,7 @@ deploy:
   before_script:
     - cp $ENV_PRODUCTION .env
   script:
-    - docker compose up -d postgres db-migrate qa-service bot-core telegram-bot vk-bot max-bot admin-service admin-ui
-    - docker compose logs -t db-migrate
+    - docker compose up -d --remove-orphans postgres bot-core vk-bot max-bot
     - docker compose ps
   only:
     - main

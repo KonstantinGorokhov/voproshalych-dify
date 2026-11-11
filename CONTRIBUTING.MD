@@ -7,13 +7,10 @@
 ## Структура проекта
 
 ```
-voproshalych_v2/
-├── bot-service/        # Бизнес-логика диалогов (FastAPI)
-├── qa-service/         # RAG-сервис: LightRAG + LLM Pool (FastAPI)
-├── max-bot/            # Адаптер MAX (Go)
-├── admin-service/      # Админ-панель backend
-├── admin-ui/           # Админ-панель frontend
-├── scripts/            # Вспомогательные скрипты
+voproshalych/
+├── bot-service/
+│   ├── core/           # bot-core: связка с Dify (FastAPI)
+│   └── bots/           # Адаптеры VK (Python) и MAX (Go)
 ├── docker-compose.yml
 └── .env.example
 ```
@@ -67,16 +64,14 @@ type(scope): description
 - `perf` — оптимизация производительности
 
 **Области (scope):**
-- `qa` — qa-service
-- `bot` — bot-service
-- `max` — max-bot
-- `admin` — admin-service / admin-ui
+- `bot` — bot-core
+- `vk` — адаптер VK
+- `max` — адаптер MAX
 
 Примеры:
 ```
-feat(qa): add question routing with classification
-fix(bot): truncate long Telegram messages
-refactor(qa): split LightRAG search and LLM generation
+feat(bot): reset Dify conversation on new dialog
+fix(vk): increase bot-core timeout
 docs: update CONTRIBUTING.MD
 ```
 
@@ -85,23 +80,15 @@ docs: update CONTRIBUTING.MD
 ### Запуск тестов
 
 ```bash
-# QA-service
-cd qa-service
-pytest tests/ -v
-
-# Bot-service
-cd bot-service
-pytest core/tests/ -v
-
-# С покрытием
-pytest tests/ --cov=qa --cov-report=term-missing
+cd bot-service/core
+pytest tests -v
 ```
 
 ### Правила тестирования
 
 - Юнит-тесты для бизнес-логики (сервисы, утилиты, парсеры)
 - Интеграционные тесты для API endpoints (с моками внешних зависимостей)
-- Тесты лежат в `tests/unit/` и `tests/integration/`
+- Тесты лежат в `bot-service/core/tests/`
 - Имена файлов: `test_*.py`
 - Фикстуры в `conftest.py`
 
@@ -114,8 +101,8 @@ cp .env.example .env
 # Запустить все сервисы
 docker compose up -d --build
 
-# Запустить без MAX-бота и админки
-docker compose up -d --build postgres db-migrate qa-service bot-core telegram-bot vk-bot
+# Только VK
+docker compose up -d --build postgres bot-core vk-bot
 ```
 
 ## Code Review

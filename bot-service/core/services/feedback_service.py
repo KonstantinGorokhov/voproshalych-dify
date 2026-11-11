@@ -1,11 +1,11 @@
-"""Сервис для хранения и обновления оценок ответов бота."""
+"""Сервис хранения ответов Dify и оценок к ним."""
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
-from db import DialogMessage, DialogSession, User, get_session
-from services.user_service import UserService
+from db import DifyMessage, get_session
 
 logger = logging.getLogger(__name__)
 
@@ -13,74 +13,84 @@ FEEDBACK_LIKE = "like"
 FEEDBACK_DISLIKE = "dislike"
 
 
-class FeedbackService:
-    """Управляет оценками ответов бота.
+@dataclass(slots=True)
+class FeedbackResult:
+    """Результат сохранения оценки.
 
-    Оценка привязывается к последнему ответу бота в активной сессии
-    пользователя. При повторном нажатии той же кнопки — возвращается
-    признак «уже оценено». При нажатии другой кнопки — оценка перезаписывается.
+    Attributes:
+        status: `saved`, `already_rated` или `error`.
+        dify_message_id: Id сообщения в Dify, если оценку нужно отправить туда.
     """
 
-    def __init__(self) -> None:
-        self._user_service = UserService()
+    status: str
+    dify_message_id: str | None = None
+
+
+class FeedbackService:
+    """Сохраняет показанные ответы и оценки пользователей."""
+
+    def save_answer(
+        self,
+        user_id: int,
+        conversation_id: str,
+        dify_message_id: str,
+        question: str,
+        answer: str,
+    ) -> int | None:
+        """Сохраняет ответ Dify и возвращает его локальный id (для кнопок оценки)."""
+
+        session = get_session()
+        try:
+            record = DifyMessage(
+                user_id=user_id,
+                dify_conversation_id=conversation_id,
+                dify_message_id=dify_message_id,
+                question=question,
+                answer=answer,
+            )
+            session.add(record)
+            session.commit()
+            return record.id
+        except Exception:
+            session.rollback()
+            logger.exception("Failed to save Dify answer")
+            return None
+        finally:
+            session.close()
 
     def save_feedback(
         self,
-        platform: str,
-        platform_user_id: str,
+        user_id: int,
         feedback_type: str,
-    ) -> str | None:
-        """Сохранить или обновить оценку последнего ответа бота.
+        answer_id: int | None = None,
+    ) -> FeedbackResult:
+        """Сохраняет оценку ответа.
 
         Args:
-            platform: Платформа (telegram, vk, max).
-            platform_user_id: ID пользователя на платформе.
-            feedback_type: Тип оценки ('like' или 'dislike').
-
-        Returns:
-            None — оценка сохранена/обновлена.
-            "already_rated" — повторная оценка того же типа.
-            "error" — внутренняя ошибка (пользователь/сессия/ответ не найдены).
+            user_id: Локальный id пользователя.
+            feedback_type: `like` или `dislike`.
+            answer_id: Локальный id ответа из кнопки; `None` — последний ответ
+                пользователя (для кнопок, отправленных до обновления).
         """
+
         session = get_session()
         try:
-            user = self._user_service.get_user(platform, platform_user_id)
-            if user is None:
-                return "error"
+            query = session.query(DifyMessage).filter(DifyMessage.user_id == user_id)
+            if answer_id is not None:
+                query = query.filter(DifyMessage.id == answer_id)
+            record = query.order_by(DifyMessage.id.desc()).first()
+            if record is None:
+                return FeedbackResult(status="error")
+            if record.feedback == feedback_type:
+                return FeedbackResult(status="already_rated")
 
-            active_session = (
-                session.query(DialogSession)
-                .filter(
-                    DialogSession.user_id == user.id,
-                    DialogSession.state.in_(("START", "DIALOG", "WAITING_ANSWER")),
-                )
-                .order_by(DialogSession.id.desc())
-                .first()
-            )
-            if active_session is None:
-                return "error"
-
-            last_answer = (
-                session.query(DialogMessage)
-                .filter(
-                    DialogMessage.session_id == active_session.id,
-                    DialogMessage.role == "assistant",
-                )
-                .order_by(DialogMessage.id.desc())
-                .first()
-            )
-            if last_answer is None:
-                return "error"
-
-            if last_answer.feedback == feedback_type:
-                return "already_rated"
-
-            last_answer.feedback = feedback_type
+            record.feedback = feedback_type
+            dify_message_id = record.dify_message_id
             session.commit()
-            return None
+            return FeedbackResult(status="saved", dify_message_id=dify_message_id)
         except Exception:
             session.rollback()
             logger.exception("Failed to save feedback")
-            return "error"
+            return FeedbackResult(status="error")
         finally:
             session.close()

@@ -1,79 +1,22 @@
+# Витрина «Вопрошалыча»: адаптеры VK и MAX → bot-core → Dify (Chatflow).
+# Логика ответов, база знаний и аналитика живут в Dify.
+
 services:
   postgres:
-    build:
-      context: ./db/postgres
-      dockerfile: Dockerfile
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-voproshalych}
       POSTGRES_USER: ${POSTGRES_USER:-voproshalych}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voproshalych}
-      PGDATA: /var/lib/postgresql/data/pgdata
-    ports:
-      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # Новый том: старая БД (pgvector/AGE, другая схема users) не переиспользуется.
+      - bot_postgres_data:/var/lib/postgresql
     healthcheck:
-      test: ["CMD", "psql", "-h", "localhost", "-p", "5432", "-U", "voproshalych", "-d", "voproshalych", "-c", "SELECT 1"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 10
-
-  db-migrate:
-    build:
-      context: ./db
-      dockerfile: Dockerfile
-    restart: "no"
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_DB: ${POSTGRES_DB:-voproshalych}
-      POSTGRES_USER: ${POSTGRES_USER:-voproshalych}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voproshalych}
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  qa-service:
-    image: voproshalych_v2-qa-service:latest
-    build:
-      context: ./qa-service
-      dockerfile: Dockerfile
-      secrets:
-        - hf_token
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      QA_SERVICE_URL: ${QA_SERVICE_URL:-http://qa-service:8004}
-      POSTGRES_HOST: postgres
-      POSTGRES_DB: ${POSTGRES_DB:-voproshalych}
-      POSTGRES_DATABASE: ${POSTGRES_DB:-voproshalych}
-      POSTGRES_USER: ${POSTGRES_USER:-voproshalych}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voproshalych}
-      HF_TOKEN: ${HF_TOKEN:-}
-      LIGHT_RAG_LLM_MODEL: ${LIGHT_RAG_LLM_MODEL:-mistral}
-    ports:
-      - "8004:8004"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      db-migrate:
-        condition: service_completed_successfully
-    # dns:
-    #   - 1.1.1.1
-    #   - 8.8.8.8
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8004/health')",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 240s
 
   bot-core:
     build:
@@ -83,15 +26,17 @@ services:
     env_file:
       - .env
     environment:
-      BOT_CORE_APP_NAME: ${BOT_CORE_APP_NAME:-bot-core}
-      BOT_CORE_APP_VERSION: ${BOT_CORE_APP_VERSION:-0.1.0}
-      MAX_BOT_INTERNAL_URL: ${MAX_BOT_INTERNAL_URL:-http://max-bot:8081}
       POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
       POSTGRES_DB: ${POSTGRES_DB:-voproshalych}
       POSTGRES_USER: ${POSTGRES_USER:-voproshalych}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voproshalych}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
+    extra_hosts:
+      # Позволяет указать DIFY_API_URL=http://host.docker.internal/v1,
+      # если Dify запущен на этом же сервере в своём compose.
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test:
         [
@@ -107,31 +52,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      db-migrate:
-        condition: service_completed_successfully
-      qa-service:
-        condition: service_healthy
-    # dns:
-    #   - 1.1.1.1
-    #   - 8.8.8.8
-
-  telegram-bot:
-    build:
-      context: ./bot-service
-      dockerfile: bots/telegram/Dockerfile
-    restart: unless-stopped
-    env_file:
-      - .env
-    environment:
-      BOT_CORE_URL: ${BOT_CORE_URL:-http://bot-core:8000}
-      BOT_CORE_TIMEOUT_SECONDS: ${BOT_CORE_TIMEOUT_SECONDS:-10}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-    # dns:
-    #   - 1.1.1.1
-    #   - 8.8.8.8
-    depends_on:
-      bot-core:
-        condition: service_healthy
 
   vk-bot:
     build:
@@ -142,11 +62,8 @@ services:
       - .env
     environment:
       BOT_CORE_URL: ${BOT_CORE_URL:-http://bot-core:8000}
-      BOT_CORE_TIMEOUT_SECONDS: ${BOT_CORE_TIMEOUT_SECONDS:-10}
+      BOT_CORE_TIMEOUT_SECONDS: ${BOT_CORE_TIMEOUT_SECONDS:-300}
       VK_BOT_TOKEN: ${VK_BOT_TOKEN}
-    # dns:
-    #   - 1.1.1.1
-    #   - 8.8.8.8
     depends_on:
       bot-core:
         condition: service_healthy
@@ -160,72 +77,11 @@ services:
       - .env
     environment:
       BOT_CORE_URL: ${BOT_CORE_URL:-http://bot-core:8000}
-      BOT_CORE_TIMEOUT_SECONDS: ${BOT_CORE_TIMEOUT_SECONDS:-10}
-      MAX_BOT_INTERNAL_PORT: ${MAX_BOT_INTERNAL_PORT:-8081}
+      BOT_CORE_TIMEOUT_SECONDS: ${BOT_CORE_TIMEOUT_SECONDS:-300}
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN}
-    # dns:
-    #   - 1.1.1.1
-    #   - 8.8.8.8
     depends_on:
       bot-core:
         condition: service_healthy
 
-  admin-service:
-    build:
-      context: ./admin-service
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      ADMIN_AUTH_USERNAME: ${ADMIN_AUTH_USERNAME}
-      ADMIN_AUTH_PASSWORD: ${ADMIN_AUTH_PASSWORD}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      db-migrate:
-        condition: service_completed_successfully
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/health')",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  admin-ui:
-    build:
-      context: ./admin-ui
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    ports:
-      - "${ADMIN_UI_PORT:-8080}:80"
-    depends_on:
-      admin-service:
-        condition: service_healthy
-
-  lightrag:
-    image: ghcr.io/hkuds/lightrag:latest
-    restart: unless-stopped
-    ports:
-      - "${LIGHTRAG_PORT:-9621}:9621"
-    env_file:
-      - .env.lightrag
-    depends_on:
-      postgres:
-        condition: service_healthy
-
 volumes:
-  postgres_data:
-
-secrets:
-  hf_token:
-    environment: ${HF_TOKEN_ENV_NAME:-HF_TOKEN}
+  bot_postgres_data:

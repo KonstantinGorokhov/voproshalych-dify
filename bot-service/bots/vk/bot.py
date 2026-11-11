@@ -37,7 +37,7 @@ class Settings:
     vk_bot_token: str = os.getenv("VK_BOT_TOKEN", "")
     bot_core_url: str = os.getenv("BOT_CORE_URL", "http://127.0.0.1:8000")
     request_timeout_seconds: float = float(
-        os.getenv("BOT_CORE_TIMEOUT_SECONDS", "10")
+        os.getenv("BOT_CORE_TIMEOUT_SECONDS", "300")
     )
 
 
@@ -145,7 +145,7 @@ def build_bot(settings: Settings, core_client: CoreClient) -> Bot:
         """
         text = (message.text or "").strip().lower()
         is_start = text in {"/start", "start", "начать"}
-        is_quick_button = text in {"помощь", "новый диалог", "рассылка", "📋 помощь", "🔄 новый диалог", "🔔 рассылка"}
+        is_quick_button = text in {"помощь", "новый диалог", "📋 помощь", "🔄 новый диалог"}
 
         pending_message_id: int | None = None
         if should_show_pending_message(message) and not is_start and not is_quick_button:

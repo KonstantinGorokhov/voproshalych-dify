@@ -1,8 +1,0 @@
-[project]
-name = "voproshalych-bot-vk"
-version = "0.1.0"
-requires-python = ">=3.12"
-dependencies = [
-    "vkbottle>=4.0",
-    "httpx>=0.28",
-]

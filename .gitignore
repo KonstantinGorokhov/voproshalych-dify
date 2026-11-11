@@ -6,7 +6,6 @@
 .env.local
 .env.*.local
 .env.prod
-.env.lightrag
 
 # Docker Compose
 docker-compose.prod.yml
@@ -43,7 +42,6 @@ pkg/
 .vscode/
 
 # Benchmarks data
-qa-service/benchmarks/data
 
 # Deployment
 Makefile
